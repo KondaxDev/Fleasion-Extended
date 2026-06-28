@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 
 from ..gui.theme import ThemeManager
 from .modifications_tab import CollapsibleSection
+from .auto_update import AutoUpdateSection
 from ..utils.autostart import sync_autostart
 from ..utils import CONFIG_DIR
 from ..utils.roblox_auth import (
@@ -96,8 +97,11 @@ class SettingsTab(QWidget):
         self._container_layout.addWidget(self._build_scraper_section())
         self._container_layout.addWidget(self._build_scraped_games_section())
         self._container_layout.addWidget(self._build_export_section())
+        self._container_layout.addWidget(
+             AutoUpdateSection(self).build()
+        )
         self._container_layout.addStretch()
-
+        
         container.setLayout(self._container_layout)
 
         footer_widget = QWidget()
@@ -370,6 +374,27 @@ class SettingsTab(QWidget):
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         for option in ("name", "id", "hash"):
+            chk = QCheckBox(option.capitalize())
+            chk.setChecked(self._config.is_export_naming_enabled(option))
+            chk.toggled.connect(lambda checked, opt=option: self._on_export_naming_toggled(checked, opt))
+            row.addWidget(chk)
+            self._export_chks[option] = chk
+        row.addStretch()
+        row_widget = QWidget()
+        row_widget.setLayout(row)
+        section.add_widget(row_widget)
+
+        return section
+
+    # Auto Update
+
+    def _build_export_section(self) -> CollapsibleSection:
+        section = CollapsibleSection('Auto Update', expanded=True)
+
+        self._export_chks: dict[str, QCheckBox] = {}
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        for option in ("Enable"):
             chk = QCheckBox(option.capitalize())
             chk.setChecked(self._config.is_export_naming_enabled(option))
             chk.toggled.connect(lambda checked, opt=option: self._on_export_naming_toggled(checked, opt))
@@ -707,3 +732,4 @@ class SettingsTab(QWidget):
             self._tray.export_naming_actions[option].setChecked(
                 self._config.is_export_naming_enabled(option)
             )
+
