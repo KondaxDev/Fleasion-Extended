@@ -67,6 +67,7 @@ from ..utils import (
     run_in_thread,
 )
 from .addons import CacheScraper, TextureStripper, UsernameSpoofer
+from .addons.plugin_loader import PluginLoader
 from .server import (
     BASE_INTERCEPT_HOSTS,
     ASSET_DELIVERY_HOST,
@@ -2582,6 +2583,12 @@ class ProxyMaster:
         self._watchdog_thread: Optional[threading.Thread] = None
         self._module_interceptors: list = [self.username_spoofer]
         self._cert_refresh_lock = threading.Lock()
+
+        # Community plugin system
+        self.plugin_loader = PluginLoader(
+            cache_manager=self.cache_manager,
+            proxy_master=self,
+        )
         self._last_cert_refresh_by_exe: dict[Path, tuple[float, str]] = {}
 
     @property
@@ -3283,6 +3290,13 @@ class ProxyMaster:
             log_buffer.log('Info', f'Unprivileged backend port: {listen_port}')
         log_buffer.log('Info', 'Launch Roblox')
         log_buffer.log('Info', '=' * 50)
+
+        # ── Load community plugins ────────────────────────────────────────
+        threading.Thread(
+            target=self.plugin_loader.load_all,
+            name='PluginLoader',
+            daemon=True,
+        ).start()
 
         # ── Pre-download private replacement assets in background ─────────
         # Runs eagerly at startup so pre-downloaded files are ready before
