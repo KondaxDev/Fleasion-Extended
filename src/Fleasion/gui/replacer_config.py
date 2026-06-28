@@ -655,6 +655,14 @@ class ReplacerConfigWindow(QDialog):
             self.proxy_master.register_module_interceptor(self._rando_stuff_tab)
             self._registered_module_interceptors.append(self._rando_stuff_tab)
 
+        # Create Addons tab (Account Health + Creator Watch + Community Plugins)
+        from .addons_tab import AddonsTab
+        self._addons_tab = AddonsTab(
+            rando_tab=self._rando_stuff_tab,
+            proxy_master=self.proxy_master,
+        )
+        self.tab_widget.addTab(self._addons_tab, 'Addons')
+
         # Create Settings tab
         from .settings_tab import SettingsTab
         self._settings_tab = SettingsTab(self.config_manager, system_tray=self._system_tray)
