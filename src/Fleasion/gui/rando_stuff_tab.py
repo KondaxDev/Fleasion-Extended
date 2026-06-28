@@ -196,6 +196,202 @@ def _preseed_root_place_for_subplace(root_place_id: str, cookie: str) -> bool:
         return False
 
 
+# Status codes stored on the account dict under "health_status":
+#   "ok"        - cookie is valid and the user is not banned
+#   "banned"    - account is terminated/banned (isBanned == True)
+#   "invalid"   - cookie is expired/invalid (logged out, rotated, etc.)
+#   "checkpoint"- Roblox is demanding a captcha / 2FA / security challenge
+#   "error"     - could not determine status (network error, etc.)
+#   "unknown"   - never checked yet
+#
+# A human-readable label is stored under "health_label" and the last
+# check time (epoch seconds) under "health_checked_at".
+
+HEALTH_LABELS = {
+    "ok": "OK",
+    "banned": "Banni",
+    "invalid": "Cookie invalide",
+    "checkpoint": "Captcha/2FA requis",
+    "error": "Erreur de vérification",
+    "unknown": "Non vérifié",
+}
+
+# Small colored dot prefixed to the username in the list widget.
+HEALTH_DOTS = {
+    "ok": "\U0001F7E2",         # green circle
+    "banned": "\U0001F534",     # red circle
+    "invalid": "\U0001F7E0",    # orange circle
+    "checkpoint": "\U0001F7E1", # yellow circle
+    "error": "\u26AA",          # white circle
+    "unknown": "\u26AA",        # white circle
+}
+
+
+def _check_account_health(cookie: str) -> tuple[str, str]:
+    """Best-effort check of an account's health using its .ROBLOSECURITY cookie.
+
+    Returns (status_code, detail_message). Never raises.
+    """
+    try:
+        sess = _requests.Session()
+        sess.trust_env = False
+        sess.proxies = {}
+        try:
+            sess.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com")
+        except Exception:
+            sess.headers["Cookie"] = f".ROBLOSECURITY={cookie};"
+
+        resp = sess.get("https://users.roblox.com/v1/users/authenticated", timeout=10)
+
+        # Roblox returns a challenge (captcha / 2FA / "verify it's you") as a
+        # 403 with challenge metadata headers on sensitive endpoints.
+        if resp.status_code == 403 and (
+            "rblx-challenge-id" in resp.headers or "rblx-challenge-type" in resp.headers
+        ):
+            return "checkpoint", "Roblox demande une vérification (captcha/2FA)."
+
+        if resp.status_code == 401:
+            return "invalid", "Cookie expirée ou invalide (401)."
+
+        if resp.status_code != 200:
+            return "invalid", f"Réponse inattendue (HTTP {resp.status_code})."
+
+        data = resp.json()
+        user_id = data.get("id")
+        if not user_id:
+            return "error", "Impossible de lire l'ID utilisateur."
+
+        # The public users endpoint exposes isBanned for the account's own ID.
+        info_resp = sess.get(f"https://users.roblox.com/v1/users/{user_id}", timeout=10)
+        if info_resp.status_code == 200:
+            info = info_resp.json()
+            if info.get("isBanned"):
+                return "banned", "Le compte est banni/terminé."
+            return "ok", "Compte valide."
+
+        # Couldn't confirm ban status, but the cookie itself is valid.
+        return "ok", "Compte valide (statut de ban non confirmé)."
+
+    except _requests.exceptions.RequestException as exc:
+        return "error", f"Erreur réseau: {exc}"
+    except Exception as exc:
+        return "error", f"Erreur: {exc}"
+
+
+def _get_auth_ticket(cookie: str) -> str | None:
+    """Fetch a Roblox authentication ticket using the user's cookie."""
+    url = "https://auth.roblox.com/v1/authentication-ticket"
+    headers = {
+        "Cookie": f".ROBLOSECURITY={cookie}",
+        "Referer": "https://www.roblox.com",
+        "Content-Type": "application/json",
+    }
+    try:
+        # First request — Roblox returns 403 with X-CSRF-TOKEN on POST endpoints
+        resp = _requests.post(url, headers=headers, json={}, timeout=10)
+        if resp.status_code == 403 and "x-csrf-token" in resp.headers:
+            headers["X-CSRF-TOKEN"] = resp.headers["x-csrf-token"]
+            resp = _requests.post(url, headers=headers, json={}, timeout=10)
+        if resp.status_code == 200:
+            return resp.headers.get("rbx-authentication-ticket")
+    except Exception:
+        pass
+    return None
+
+
+def _get_access_code(place_id: str, link_code: str, cookie: str) -> str | None:
+    """Resolve a privateServerLinkCode to the UUID accessCode.
+
+    Tries the games API first, then falls back to parsing the game page HTML
+    (the approach used by Roblox Account Manager).
+    """
+    sess = _requests.Session()
+    sess.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com")
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
+    # games.roblox.com API (fastest path)
+    for url in (
+        f"https://games.roblox.com/v1/private-servers?serverLinkCode={link_code}",
+        f"https://games.roblox.com/v1/private-servers/{link_code}",
+    ):
+        try:
+            resp = sess.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                code = data.get("accessCode") or data.get("vipServerAccessCode")
+                if code:
+                    return code
+        except Exception:
+            pass
+
+    # Fall back to parsing game page HTML
+    try:
+        resp = sess.get(
+            f"https://www.roblox.com/games/{place_id}",
+            params={"privateServerLinkCode": link_code},
+            headers={"Referer": "https://www.roblox.com/games/4924922222/Brookhaven-RP"},
+            timeout=15,
+        )
+        for pat in (
+            r"Roblox\.GameLauncher\.joinPrivateGame\(\d+,\s*'([\w-]+)'",
+            r"Roblox\.GameLauncher\.joinPrivateGame\(\d+,\s*\"([\w-]+)\"",
+            r'"accessCode"\s*:\s*"([\w-]{36})"',
+        ):
+            m = re.search(pat, resp.text)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+
+    return None
+
+
+def _preseed_root_place_for_subplace(root_place_id: str, cookie: str) -> bool:
+    """Prime Roblox's join state for a subplace launch by joining the root place."""
+    if not root_place_id or not cookie:
+        return False
+    try:
+        sess = _requests.Session()
+        sess.trust_env = False
+        sess.proxies = {}
+        sess.verify = False
+        sess.headers.update({
+            "User-Agent": "Roblox/WinInet",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Referer": "https://www.roblox.com/",
+            "Origin": "https://www.roblox.com",
+            "Cookie": f".ROBLOSECURITY={cookie};",
+        })
+        try:
+            token_resp = sess.post("https://auth.roblox.com/v2/logout", timeout=10)
+            token = token_resp.headers.get("x-csrf-token") or token_resp.headers.get("X-CSRF-TOKEN")
+            if token:
+                sess.headers["X-CSRF-TOKEN"] = token
+        except Exception:
+            pass
+
+        payload = {
+            "placeId": int(root_place_id),
+            "isTeleport": True,
+            "isImmersiveAdsTeleport": False,
+            "gameJoinAttemptId": str(uuid.uuid4()),
+        }
+        resp = sess.post("https://gamejoin.roblox.com/v1/join-game", json=payload, timeout=15)
+        try:
+            return resp.status_code == 200 and resp.json().get("status") == 2
+        except Exception:
+            return False
+    except Exception as exc:
+        log_buffer.log("accounts", f"Subplace root pre-seed error: {exc}")
+        return False
+
+
+
+
 _UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.IGNORECASE)
 
 def _extract_job_id(raw: str) -> str:
@@ -544,6 +740,7 @@ class RandoStuffTab(QWidget):
     """Rando Stuff tab – proxy interceptor + UI combined."""
 
     selected_account_changed = pyqtSignal(str)
+    account_health_updated = pyqtSignal()  # emitted after each health check result
 
     _WANTED_ENDPOINTS = (
         "/v1/join-game",
@@ -1656,6 +1853,924 @@ class RandoStuffTab(QWidget):
         self._account_list.setCurrentRow(selected_index)
         log_buffer.log("accounts", f"Imported Roblox browser login for {username} from {source}")
         QMessageBox.information(self, "Browser Login Imported", f"Imported {username} from {source}.")
+
+
+    def _on_game_link_changed(self, text: str):
+        if _parse_optional_place_id(self._subplace_id_input.text()):
+            if self._auto_filled_for_place is not None:
+                self._job_id_input.clear()
+                self._auto_filled_for_place = None
+            return
+
+        place_id, link_code = _parse_game_link(text.strip())
+        if place_id and not link_code:
+            # Normal game link — auto-fill stored jobId if field is empty or was auto-filled
+            stored_job = self._game_jobs.get(place_id, "")
+            current = self._job_id_input.text().strip()
+            if not current or self._auto_filled_for_place is not None:
+                self._job_id_input.setText(stored_job)
+                self._auto_filled_for_place = place_id if stored_job else None
+        elif link_code:
+            # Private server link — clear any auto-filled jobId
+            if self._auto_filled_for_place is not None:
+                self._job_id_input.clear()
+                self._auto_filled_for_place = None
+        else:
+            if self._auto_filled_for_place is not None:
+                self._job_id_input.clear()
+                self._auto_filled_for_place = None
+
+    def _on_subplace_id_changed(self, text: str):
+        if _parse_optional_place_id(text):
+            if self._auto_filled_for_place is not None:
+                self._job_id_input.clear()
+                self._auto_filled_for_place = None
+            return
+        self._on_game_link_changed(self._private_server_input.text())
+
+    def _set_selected_account(self, username: str):
+        username = (username or '').strip()
+        if not username:
+            self._selected_label.setText('Selected: (none)')
+            return
+        self._selected_label.setText(f'Selected: {username}')
+        self.selected_account_changed.emit(username)
+
+    def _resolve_current_user(self):
+        """Background thread: read the active Roblox cookie and update the selected label."""
+        from ..utils.roblox_auth import get_roblosecurity as _get_roblosecurity
+        cookie = _get_roblosecurity()
+        if not cookie:
+            return
+        try:
+            sess = _requests.Session()
+            sess.trust_env = False
+            sess.proxies = {}
+            try:
+                sess.cookies.set(".ROBLOSECURITY", cookie)
+            except Exception:
+                sess.headers["Cookie"] = f".ROBLOSECURITY={cookie};"
+            resp = sess.get("https://users.roblox.com/v1/users/authenticated", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                username = data.get("name", "")
+                user_id = data.get("id")
+                with self._lock:
+                    self._username_spoofer_current_user_id = str(user_id) if user_id is not None else None
+                    self._username_spoofer_current_username = str(username or '')
+                self._push_username_spoofer_current_user()
+                if username:
+                    def _update(u=username):
+                        self._set_selected_account(u)
+                    self._on_main(_update)
+        except Exception:
+            pass
+
+    def _check_cookies_on_boot(self):
+        """Background thread: validate every stored cookie and flag expired ones in the list."""
+        for idx, acc in enumerate(self._accounts):
+            cookie = _decrypt_cookie(acc.get("cookie", ""))
+            expired = not cookie
+            if not expired:
+                try:
+                    sess = _requests.Session()
+                    sess.trust_env = False
+                    sess.proxies = {}
+                    try:
+                        sess.cookies.set(".ROBLOSECURITY", cookie)
+                    except Exception:
+                        sess.headers["Cookie"] = f".ROBLOSECURITY={cookie};"
+                    resp = sess.get(
+                        "https://users.roblox.com/v1/users/authenticated",
+                        timeout=10,
+                    )
+                    expired = resp.status_code != 200
+                except Exception:
+                    pass  # Network error — don't mark as expired
+            if expired:
+                def _mark(i=idx):
+                    item = self._account_list.item(i)
+                    if item:
+                        item.setText("Expired! Right click to update.")
+                self._on_main(_mark)
+
+    def _populate_account_list(self):
+        self._account_list.clear()
+        for acc in self._accounts:
+            status = acc.get("health_status", "unknown")
+            dot = HEALTH_DOTS.get(status, HEALTH_DOTS["unknown"])
+            label = acc.get("health_label") or HEALTH_LABELS.get(status, HEALTH_LABELS["unknown"])
+            username = acc.get("username", "(unknown)")
+            item = QListWidgetItem(f"{dot} {username}  —  {label}")
+            item.setToolTip(label)
+            self._account_list.addItem(item)
+
+    def _on_add_account(self):
+        dlg = AddAccountDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        username = dlg.result_username
+        cookie = dlg.result_cookie
+        if not username or not cookie:
+            return
+        self._accounts.append({"username": username, "cookie": _encrypt_cookie(cookie)})
+        _save_accounts(self._accounts)
+        self._populate_account_list()
+        # Select the newly added entry
+        self._account_list.setCurrentRow(len(self._accounts) - 1)
+
+    def _on_import_browser_account(self):
+        self._import_browser_btn.setEnabled(False)
+        self._import_browser_btn.setText("Importing...")
+
+        def _import():
+            cookie, source = discover_browser_roblosecurity(include_keychain=True, explicit_import=True)
+            if not cookie:
+                self._on_main(lambda: self._finish_browser_import(None, None, None))
+                return
+            try:
+                session = _requests.Session()
+                session.trust_env = False
+                session.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com")
+                response = session.get("https://users.roblox.com/v1/users/authenticated", timeout=10)
+                username = str(response.json().get("name") or "") if response.status_code == 200 else ""
+            except Exception:
+                username = ""
+            self._on_main(lambda: self._finish_browser_import(username, cookie, source))
+
+        threading.Thread(target=_import, daemon=True, name='fleasion-browser-cookie-import').start()
+
+    def _finish_browser_import(self, username: str | None, cookie: str | None, source: str | None):
+        self._import_browser_btn.setEnabled(True)
+        self._import_browser_btn.setText("Import Browser Login")
+        if not username or not cookie:
+            QMessageBox.warning(
+                self,
+                "Browser Login Not Found",
+                "No usable Roblox login was found in Firefox or a Chrome-family browser.\n\n"
+                "Log in to roblox.com in a browser, then try again.",
+            )
+            return
+
+        existing_index = next(
+            (index for index, account in enumerate(self._accounts) if account.get("username") == username),
+            None,
+        )
+        account = {"username": username, "cookie": _encrypt_cookie(cookie)}
+        if existing_index is None:
+            self._accounts.append(account)
+            selected_index = len(self._accounts) - 1
+        else:
+            self._accounts[existing_index] = account
+            selected_index = existing_index
+        _save_accounts(self._accounts)
+        self._populate_account_list()
+        self._account_list.setCurrentRow(selected_index)
+        log_buffer.log("accounts", f"Imported Roblox browser login for {username} from {source}")
+        QMessageBox.information(self, "Browser Login Imported", f"Imported {username} from {source}.")
+
+    def _on_account_ctx_menu(self, pos):
+        item = self._account_list.itemAt(pos)
+        menu = QMenu(self)
+        check_all_action = menu.addAction("Check Health (all accounts)")
+        change_action = None
+        remove_action = None
+        check_one_action = None
+        if item is not None:
+            idx = self._account_list.row(item)
+            check_one_action = menu.addAction("Check Health (this account)")
+            menu.addSeparator()
+            change_action = menu.addAction("Change Cookie")
+            remove_action = menu.addAction("Remove")
+        action = menu.exec(self._account_list.viewport().mapToGlobal(pos))
+        if action is None:
+            return
+        if action == check_all_action:
+            self._check_all_accounts_health()
+        elif item is not None:
+            idx = self._account_list.row(item)
+            if action == check_one_action:
+                self._check_account_health_async(idx)
+            elif action == change_action:
+                self._change_cookie(idx)
+            elif action == remove_action:
+                self._remove_account(idx)
+
+    def _set_account_health(self, idx: int, status: str, message: str):
+        """Persist a health-check result for the account at idx and refresh the UI."""
+        if idx < 0 or idx >= len(self._accounts):
+            return
+        self._accounts[idx]["health_status"] = status
+        self._accounts[idx]["health_label"] = HEALTH_LABELS.get(status, message)
+        self._accounts[idx]["health_detail"] = message
+        self._accounts[idx]["health_checked_at"] = time.time()
+        _save_accounts(self._accounts)
+        self._populate_account_list()
+        self.account_health_updated.emit()
+
+    def _check_account_health_async(self, idx: int):
+        """Run a health check for one account in a background thread."""
+        if idx < 0 or idx >= len(self._accounts):
+            return
+        acc = self._accounts[idx]
+        username = acc.get("username", "(unknown)")
+        cookie = _decrypt_cookie(acc.get("cookie", ""))
+        if not cookie:
+            self._on_main(lambda: self._set_account_health(idx, "invalid", "Cookie illisible/corrompue."))
+            return
+        log_buffer.log("accounts", f"Checking health for {username}…")
+
+        def _run():
+            status, message = _check_account_health(cookie)
+            self._on_main(lambda: self._set_account_health(idx, status, message))
+            log_buffer.log("accounts", f"Health for {username}: {HEALTH_LABELS.get(status, status)} ({message})")
+
+        threading.Thread(target=_run, daemon=True, name="fleasion-account-health").start()
+
+    def _check_all_accounts_health(self):
+        """Run a health check for every saved account, a few at a time."""
+        if not self._accounts:
+            QMessageBox.information(self, "No Accounts", "No accounts to check yet.")
+            return
+        for idx in range(len(self._accounts)):
+            # Stagger slightly to be polite to Roblox's API.
+            QTimer.singleShot(idx * 250, lambda i=idx: self._check_account_health_async(i))
+
+    def _change_cookie(self, idx: int):
+        dlg = AddAccountDialog(self, title="Change Cookie")
+        dlg.set_ok_label("Update")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        username = dlg.result_username
+        cookie = dlg.result_cookie
+        if not username or not cookie:
+            return
+        self._accounts[idx] = {"username": username, "cookie": _encrypt_cookie(cookie)}
+        _save_accounts(self._accounts)
+        self._populate_account_list()
+        self._account_list.setCurrentRow(idx)
+
+    def _remove_account(self, idx: int):
+        username = self._accounts[idx].get("username", "(unknown)")
+        reply = QMessageBox.question(
+            self,
+            "Remove Account",
+            f"Remove '{username}' from the list?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._accounts.pop(idx)
+        _save_accounts(self._accounts)
+        self._populate_account_list()
+
+    def _on_launch_account(self):
+        log_buffer.log("accounts", "Launch button clicked")
+        acc = self._last_switched_account
+        if acc is None:
+            log_buffer.log("accounts", "Launch aborted: no switched account selected")
+            QMessageBox.information(self, "No Account Switched",
+                                    "Use 'Switch to selected' first to pick an account.")
+            return
+        cookie = _decrypt_cookie(acc.get("cookie", ""))
+        if not cookie:
+            log_buffer.log("accounts", "Launch aborted: failed to decrypt cookie")
+            QMessageBox.warning(self, "Error", "Could not decrypt the stored cookie.")
+            return
+        username = acc.get("username", "(unknown)")
+
+        known_status = acc.get("health_status")
+        if known_status in ("banned", "invalid", "checkpoint"):
+            label = HEALTH_LABELS.get(known_status, known_status)
+            proceed = QMessageBox.question(
+                self,
+                "Compte potentiellement mort",
+                f"'{username}' est marqué comme : {label}\n"
+                "(d'après le dernier Check Health). Lancer quand même ?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if proceed != QMessageBox.StandardButton.Yes:
+                log_buffer.log("accounts", f"Launch aborted by user: {username} flagged as {known_status}")
+                return
+
+        link = self._private_server_input.text().strip()
+        subplace_raw = self._subplace_id_input.text().strip()
+        subplace_id = _parse_optional_place_id(subplace_raw)
+        if subplace_raw and not subplace_id:
+            log_buffer.log("accounts", f"Launch aborted: invalid subplace ID: {subplace_raw}")
+            QMessageBox.warning(self, "Invalid Subplace ID", "Enter a numeric subplace ID or Roblox game URL.")
+            return
+        job_id = _extract_job_id(self._job_id_input.text())
+        log_buffer.log(
+            "accounts",
+            f"Launch request prepared for {username}: hasLink={'yes' if bool(link) else 'no'}, "
+            f"hasSubplace={'yes' if bool(subplace_id) else 'no'}, hasJobId={'yes' if bool(job_id) else 'no'}",
+        )
+
+        if _is_share_link(link):
+            self._launch_acct_btn.setEnabled(False)
+            self._launch_acct_btn.setText("Resolving…")
+            def _resolve_thread():
+                place_id, link_code = _resolve_share_link(link, cookie)
+                def _done():
+                    self._launch_acct_btn.setEnabled(True)
+                    self._launch_acct_btn.setText("Launch")
+                    if place_id and link_code:
+                        resolved = f"https://www.roblox.com/games/{place_id}/game?privateServerLinkCode={link_code}"
+                        self._private_server_input.setText(resolved)
+                        threading.Thread(
+                            target=self._launch_account_thread,
+                            args=(cookie, username, resolved, job_id, subplace_id or ""),
+                            daemon=True,
+                        ).start()
+                    else:
+                        QMessageBox.warning(
+                            self,
+                            "Unsupported Link Format",
+                            "This looks like a Roblox share link:\n"
+                            f"  {link}\n\n"
+                            "Paste it into your browser first — it will redirect to the full "
+                            "private server link (with privateServerLinkCode=…). "
+                            "Copy that URL and paste it here instead.",
+                        )
+                self._on_main(_done)
+            threading.Thread(target=_resolve_thread, daemon=True).start()
+            return
+
+        threading.Thread(
+            target=self._launch_account_thread,
+            args=(cookie, username, link, job_id, subplace_id or ""),
+            daemon=True,
+        ).start()
+
+    def _on_switch_account(self):
+        idx = self._account_list.currentRow()
+        if idx < 0:
+            QMessageBox.information(self, "No Selection", "Select an account first.")
+            return
+        acc = self._accounts[idx]
+        cookie = _decrypt_cookie(acc.get("cookie", ""))
+        if not cookie:
+            QMessageBox.warning(self, "Error", "Could not decrypt the stored cookie.")
+            return
+        username = acc.get("username", "(unknown)")
+        if not IS_WINDOWS:
+            self._last_switched_account = acc
+            self._set_selected_account(username)
+            log_buffer.log(
+                "accounts",
+                f"Selected account for Fleasion launches on macOS: {username} "
+                "(RobloxCookies.dat switching is Windows-only)",
+            )
+            QMessageBox.information(
+                self,
+                "Account Selected",
+                "This account will be used for Fleasion launches. macOS Roblox does not expose "
+                "the Windows RobloxCookies.dat file for local cookie switching.",
+            )
+            return
+        try:
+            self._write_cookie_to_dat(cookie)
+            self._last_switched_account = acc
+            self._set_selected_account(username)
+            log_buffer.log("accounts", f"Switched Roblox cookie to account: {username}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Error", f"Failed to write cookie: {exc}")
+
+    def _show_selected_account_launch_failed(self, username: str, reason: str):
+        def _warn():
+            QMessageBox.warning(
+                self,
+                "Selected Account Launch Failed",
+                f"Fleasion could not launch Roblox as {username}.\n\n"
+                f"{reason}\n\n"
+                "Opening Roblox normally may use the account already signed in to Roblox instead.",
+            )
+
+        self._on_main(_warn)
+
+    def _get_launch_auth_ticket(self, cookie: str, mode: str) -> str | None:
+        log_buffer.log("accounts", f"Requesting auth ticket for {mode} launch")
+        ticket = _get_auth_ticket(cookie)
+        if ticket:
+            log_buffer.log("accounts", f"Auth-ticket retrieval succeeded for {mode} launch")
+        else:
+            log_buffer.log("accounts", f"Auth-ticket retrieval failed for {mode} launch")
+        return ticket
+
+    def _launch_account_thread(
+        self,
+        cookie: str,
+        username: str,
+        private_server_link: str = "",
+        job_id: str = "",
+        subplace_id: str = "",
+    ):
+        if IS_WINDOWS:
+            try:
+                self._write_cookie_to_dat(cookie)
+            except Exception as exc:
+                log_buffer.log("accounts", f"Failed to write cookie file: {exc}")
+        else:
+            log_buffer.log("accounts", "Skipping RobloxCookies.dat write on macOS; using auth-ticket launch")
+
+        exe = _find_roblox_exe()
+        if not exe:
+            log_buffer.log("accounts", "Roblox executable resolution failed before launch")
+            QTimer.singleShot(0, lambda: QMessageBox.warning(
+                self, "Roblox Not Found",
+                "Could not locate Roblox Player. Is Roblox installed?"
+            ))
+            return
+        log_buffer.log("accounts", f"Resolved Roblox executable: {exe}")
+
+        place_id, link_code = _parse_game_link(private_server_link)
+        launch_place_id = subplace_id or place_id
+        log_buffer.log(
+            "accounts",
+            f"Launch parse result: placeId={place_id or '(none)'}, "
+            f"subplaceId={subplace_id or '(none)'}, launchPlaceId={launch_place_id or '(none)'}, "
+            f"linkCode={'present' if bool(link_code) else 'missing'}, jobId={'present' if bool(job_id) else 'missing'}",
+        )
+        root_place_id = self._normalize_numeric_id(place_id)
+        normalized_launch_place_id = self._normalize_numeric_id(launch_place_id)
+        is_distinct_subplace_launch = (
+            bool(subplace_id)
+            and root_place_id is not None
+            and normalized_launch_place_id is not None
+            and normalized_launch_place_id != root_place_id
+        )
+        with self._lock:
+            self._account_manager_teleport_place_id = (
+                normalized_launch_place_id if is_distinct_subplace_launch else None
+            )
+        if is_distinct_subplace_launch:
+            ok = _preseed_root_place_for_subplace(root_place_id, cookie)
+            if not ok:
+                log_buffer.log("accounts", f"Subplace root pre-seed failed for root {root_place_id}")
+        launch_ok = False
+        if place_id and link_code and launch_place_id:
+            # Private server launch
+            ticket = self._get_launch_auth_ticket(cookie, "private-server")
+            if ticket:
+                access_code = _get_access_code(place_id, link_code, cookie) or link_code
+                roblox_player_uri = _build_auth_ticket_private_server_uri(
+                    ticket,
+                    launch_place_id,
+                    access_code=access_code,
+                    link_code=link_code,
+                )
+                log_buffer.log("accounts", f"Launching Roblox URI to placeId={launch_place_id} (private server)")
+                launch_ok = launch_as_standard_user(roblox_player_uri)
+                if not launch_ok:
+                    log_buffer.log("accounts", "Failed to launch Roblox URI without elevation")
+            else:
+                if IS_MACOS:
+                    self._show_selected_account_launch_failed(
+                        username,
+                        "Roblox did not issue an authentication ticket for the private-server launch.",
+                    )
+                    launch_ok = False
+                    log_buffer.log("accounts", f"Launch failed for account: {username}")
+                    return
+                log_buffer.log("accounts", "Failed to get auth ticket, falling back to deeplink")
+                deeplink = f"roblox://experiences/start?placeId={launch_place_id}&linkCode={link_code}"
+                log_buffer.log("accounts", f"Launching Roblox executable fallback: {exe}")
+                exe_started = launch_as_standard_user(exe)
+                if not exe_started:
+                    log_buffer.log("accounts", "Failed to launch Roblox Player without elevation")
+                time.sleep(3)
+                log_buffer.log("accounts", f"Launching Roblox deeplink to placeId={launch_place_id} with linkCode")
+                deeplink_started = launch_as_standard_user(deeplink)
+                if not deeplink_started:
+                    log_buffer.log("accounts", "Failed to launch Roblox deeplink without elevation")
+                launch_ok = exe_started and deeplink_started
+        elif launch_place_id:
+            # Normal game link — optionally join a specific job
+            ticket = self._get_launch_auth_ticket(cookie, "place" if not job_id else "job-id")
+            if ticket:
+                if not job_id:
+                    with self._lock:
+                        self._account_manager_capture_place_id = launch_place_id
+                roblox_player_uri = _build_auth_ticket_place_uri(
+                    ticket,
+                    launch_place_id,
+                    job_id=job_id,
+                )
+                if job_id:
+                    log_buffer.log("accounts", f"Launching Roblox URI to placeId={launch_place_id}, gameId={job_id}")
+                else:
+                    log_buffer.log("accounts", f"Launching Roblox URI to placeId={launch_place_id}")
+                launch_ok = launch_as_standard_user(roblox_player_uri)
+                if not launch_ok:
+                    log_buffer.log("accounts", "Failed to launch Roblox URI without elevation")
+            else:
+                if IS_MACOS:
+                    self._show_selected_account_launch_failed(
+                        username,
+                        "Roblox did not issue an authentication ticket for the selected-account place launch.",
+                    )
+                    launch_ok = False
+                    log_buffer.log("accounts", f"Launch failed for account: {username}")
+                    return
+                log_buffer.log("accounts", "Failed to get auth ticket, falling back to deeplink")
+                if not job_id:
+                    with self._lock:
+                        self._account_manager_capture_place_id = launch_place_id
+                    # Proxy intercept will handle jobId capture; set pending job ID to empty
+                    with self._lock:
+                        self._account_manager_job_id = ""
+                else:
+                    with self._lock:
+                        self._account_manager_job_id = job_id
+                deeplink = f"roblox://experiences/start?placeId={launch_place_id}"
+                log_buffer.log("accounts", f"Launching Roblox executable fallback: {exe}")
+                exe_started = launch_as_standard_user(exe)
+                if not exe_started:
+                    log_buffer.log("accounts", "Failed to launch Roblox Player without elevation")
+                time.sleep(3)
+                log_buffer.log("accounts", f"Launching Roblox deeplink to placeId={launch_place_id}")
+                deeplink_started = launch_as_standard_user(deeplink)
+                if not deeplink_started:
+                    log_buffer.log("accounts", "Failed to launch Roblox deeplink without elevation")
+                launch_ok = exe_started and deeplink_started
+        else:
+            if IS_MACOS:
+                ticket = self._get_launch_auth_ticket(cookie, "app")
+                if ticket:
+                    roblox_player_uri = _build_auth_ticket_app_uri(ticket)
+                    log_buffer.log("accounts", "Launching Roblox app URI for selected macOS account")
+                    launch_ok = launch_as_standard_user(roblox_player_uri)
+                    if not launch_ok:
+                        log_buffer.log("accounts", "Failed to launch Roblox app URI without elevation")
+                        self._show_selected_account_launch_failed(
+                            username,
+                            "Roblox accepted the account ticket request, but macOS did not open the Roblox app URI.",
+                        )
+                else:
+                    self._show_selected_account_launch_failed(
+                        username,
+                        "Roblox did not issue an authentication ticket for the app launch.",
+                    )
+            else:
+                log_buffer.log("accounts", f"Launching Roblox executable: {exe}")
+                launch_ok = launch_as_standard_user(exe)
+                if not launch_ok:
+                    log_buffer.log("accounts", "Failed to launch Roblox Player without elevation")
+        if launch_ok:
+            log_buffer.log("accounts", f"Launched Roblox for account: {username}")
+        else:
+            log_buffer.log("accounts", f"Launch failed for account: {username}")
+
+    def _write_cookie_to_dat(self, cookie: str):
+        """Replace the .ROBLOSECURITY value in RobloxCookies.dat and re-encrypt."""
+        if not IS_WINDOWS:
+            raise RuntimeError("RobloxCookies.dat switching is only supported on Windows")
+        if not ROBLOX_COOKIES_PATH.exists():
+            log_buffer.log("accounts", "RobloxCookies.dat not found - launch Roblox once first")
+            return
+        if not set_roblosecurity(cookie):
+            log_buffer.log("accounts", f"Failed to update RobloxCookies.dat at {ROBLOX_COOKIES_PATH}")
+            return
+        self._account_switched = True
+
+    def is_multi_instance_enabled(self) -> bool:
+        """Return True if the multi-instance checkbox is checked."""
+        return IS_WINDOWS and self._multi_chk.isChecked()
+
+    def close_singleton_event(self):
+        """Close the Roblox singleton event to allow a new instance, then clear the switched flag."""
+        if not IS_WINDOWS:
+            self._account_switched = False
+            return
+        try:
+            self._close_singleton_event()
+        except Exception as exc:
+            log_buffer.log("multiinstance", f"close_singleton_event error: {exc}")
+        self._account_switched = False
+
+    def get_roblox_exe(self) -> str | None:
+        """Return the path to the platform Roblox Player executable, or None if not found."""
+        return _find_roblox_exe()
+
+    # R6 <-> R15 Animation Converter
+
+    def _ac_import(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Open Animation File', '',
+            'Roblox Animation (*.rbxmx *.rbxm);;All files (*.*)',
+        )
+        if not path:
+            return
+        p = Path(path)
+        try:
+            data = p.read_bytes()
+        except Exception as e:
+            self._ac_status_lbl.setText(f'Read error: {e}')
+            return
+
+        # Detect rig from original bytes (binary parser handles .bin/.rbxm natively)
+        try:
+            from ..utils.anim_converter import detect_rig
+            rig = detect_rig(data)
+        except Exception:
+            rig = 'unknown'
+
+        # Auto-convert binary .rbxm -> .rbxmx so _ac_convert has XML to work with
+        if p.suffix.lower() == '.rbxm':
+            try:
+                from ..utils.anim_converter import rbxm_to_rbxmx
+                data = rbxm_to_rbxmx(data)
+                self._ac_status_lbl.setText('Auto-converted .rbxm → .rbxmx')
+            except Exception as e:
+                self._ac_status_lbl.setText(f'.rbxm conversion failed: {e}')
+                return
+        else:
+            self._ac_status_lbl.setText('')
+
+        self._ac_xml_bytes = data
+        self._ac_source_path = p
+
+        self._ac_rig_lbl.setText(f'Detected rig: {rig}')
+        self._ac_file_lbl.setText(p.name)
+        self._ac_to_r6_btn.setEnabled(rig == 'R15')
+        self._ac_to_r15_btn.setEnabled(rig == 'R6')
+
+    def _ac_convert(self, target: str):
+        if not hasattr(self, '_ac_xml_bytes'):
+            self._ac_status_lbl.setText('No file loaded.')
+            return
+
+        try:
+            import xml.etree.ElementTree as ET
+            from ..utils.r15_to_r6 import (convert_keyframe_r15_to_r6,
+                                            convert_keyframe_r6_to_r15, sanitize_xml)
+            from ..utils.rig_data import R6_PARTS, R6_JOINTS, R15_PARTS, R15_JOINTS
+
+            xml_bytes = self._ac_xml_bytes
+
+            # If this is a CurveAnimation, convert to KeyframeSequence first
+            if b'CurveAnimation' in xml_bytes:
+                from ..utils.anim_converter import curve_anim_to_keyframe
+                xml_bytes = curve_anim_to_keyframe(xml_bytes)
+
+            root = ET.fromstring(sanitize_xml(xml_bytes))
+            etree = ET.ElementTree(root)
+
+            ks = root.find("Item[@class='KeyframeSequence']")
+            if ks is None:
+                self._ac_status_lbl.setText('No KeyframeSequence found.')
+                return
+            keyframes = ks.findall("Item[@class='Keyframe']")
+            if not keyframes:
+                self._ac_status_lbl.setText('No Keyframes found.')
+                return
+
+            if target == 'R6':
+                for kf in keyframes:
+                    convert_keyframe_r15_to_r6(kf, R6_PARTS, R6_JOINTS, R15_PARTS, R15_JOINTS)
+            else:
+                for kf in keyframes:
+                    convert_keyframe_r6_to_r15(kf, R6_PARTS, R6_JOINTS, R15_PARTS, R15_JOINTS)
+
+            suffix = '_r6' if target == 'R6' else '_r15'
+            default_name = self._ac_source_path.stem + suffix + '.rbxmx'
+            default_dir = str(self._ac_source_path.parent)
+            out_str, _ = QFileDialog.getSaveFileName(
+                self, 'Save Converted Animation', f'{default_dir}/{default_name}',
+                'Roblox Animation (*.rbxmx);;All files (*.*)',
+            )
+            if not out_str:
+                self._ac_status_lbl.setText('Cancelled.')
+                return
+            out_path = Path(out_str)
+            etree.write(str(out_path), encoding='utf-8', xml_declaration=True)
+            self._ac_status_lbl.setText(f'Saved: {out_path.name}')
+        except Exception as e:
+            self._ac_status_lbl.setText(f'Error: {e}')
+
+    # Proxy interceptor hooks
+
+    def request(self, flow):
+        url = flow.request.pretty_url
+        if "gamejoin.roblox.com" not in url:
+            return
+
+        parsed = urlparse(url)
+
+        if parsed.path == self._PRIVATE_GAME_ENDPOINT:
+            try:
+                body = json.loads(flow.request.content)
+                if self._apply_account_manager_subplace_teleport(body):
+                    flow.request.raw_content = json.dumps(body, separators=(",", ":")).encode("utf-8")
+            except Exception as exc:
+                log_buffer.log("accounts", f"Failed to parse join-private-game body: {exc}")
+            return
+
+        if parsed.path == self._RESERVED_GAME_ENDPOINT:
+            try:
+                body = json.loads(flow.request.content)
+                if self._apply_account_manager_subplace_teleport(body):
+                    flow.request.raw_content = json.dumps(body, separators=(",", ":")).encode("utf-8")
+                place_id = body.get("placeId")
+                access_code = body.get("accessCode")
+                attempt_id = body.get('gameJoinAttemptId')
+                normalized_place_id = self._normalize_numeric_id(place_id)
+                if (
+                    normalized_place_id is not None
+                    and normalized_place_id in self._subplace_blacklisted_ids
+                    and not self._is_subplace_unblock_active()
+                ):
+                    self._drop_subplace_join(flow, normalized_place_id, attempt_id=str(attempt_id) if attempt_id else None)
+                    return
+                session_id = flow.request.headers.get("Roblox-Session-Id", "")
+                if place_id is not None and access_code is not None:
+                    with self._lock:
+                        self._last_place_id = place_id
+                        self._last_access_code = access_code
+                        self._last_session_id = session_id or None
+                    has_session = bool(session_id)
+                    log_buffer.log(
+                        "randostuff", f"Logged reserved server — placeId={place_id}, "
+                        f"sessionHeader={'present' if has_session else 'missing'}"
+                    )
+                    self._update_labels(place_id, access_code)
+            except Exception as exc:
+                log_buffer.log("randostuff", f"Failed to parse join-reserved-game body: {exc}")
+            return
+
+        if parsed.path not in self._WANTED_ENDPOINTS:
+            return
+
+        try:
+            precheck_body = json.loads(flow.request.content)
+            blocked_place_id = self._normalize_numeric_id(precheck_body.get('placeId'))
+            if (
+                blocked_place_id is not None
+                and blocked_place_id in self._subplace_blacklisted_ids
+                and not self._is_subplace_unblock_active()
+            ):
+                precheck_attempt_id = precheck_body.get('gameJoinAttemptId')
+                self._drop_subplace_join(
+                    flow,
+                    blocked_place_id,
+                    attempt_id=str(precheck_attempt_id) if precheck_attempt_id else None,
+                )
+                return
+        except Exception:
+            pass
+
+        account_body = None
+        account_body_modified = False
+        if parsed.path in self._WANTED_ENDPOINTS:
+            try:
+                account_body = json.loads(flow.request.content)
+                account_body_modified = self._apply_account_manager_subplace_teleport(account_body)
+            except Exception:
+                account_body = None
+
+        # Account manager: redirect join-game to join-game-instance if a jobId is pending
+        if parsed.path == "/v1/join-game":
+            with self._lock:
+                pending_job = self._account_manager_job_id
+            if pending_job:
+                try:
+                    body = account_body if isinstance(account_body, dict) else json.loads(flow.request.content)
+                    body["gameId"] = pending_job
+                    flow.request.url = "https://gamejoin.roblox.com/v1/join-game-instance"
+                    flow.request.raw_content = json.dumps(body, separators=(",", ":")).encode("utf-8")
+                    with self._lock:
+                        self._account_manager_job_id = ""
+                    log_buffer.log("accounts", f"Redirected join-game -> join-game-instance with jobId={pending_job}")
+                except Exception as exc:
+                    log_buffer.log("accounts", f"Failed to intercept join-game for jobId: {exc}")
+                return
+
+        if account_body_modified and isinstance(account_body, dict):
+            flow.request.raw_content = json.dumps(account_body, separators=(",", ":")).encode("utf-8")
+
+        try:
+            req_body = account_body if isinstance(account_body, dict) else json.loads(flow.request.content)
+            attempt_id = req_body.get("gameJoinAttemptId")
+        except Exception:
+            req_body = {}
+            attempt_id = None
+
+        with self._lock:
+            doing = self._doing_rejoin
+            active_id = self._active_rejoin_attempt_id
+            place_id = self._last_place_id
+            access_code = self._last_access_code
+            session_id = self._last_session_id
+
+            # First interception: consume the flag, record the attempt ID
+            if doing:
+                self._doing_rejoin = False
+                self._active_rejoin_attempt_id = attempt_id
+                active_id = attempt_id
+            # Follow-up polls: only intercept if attempt ID matches
+            elif active_id is None or attempt_id != active_id:
+                return
+
+        if place_id is None or access_code is None:
+            log_buffer.log("randostuff", "Rejoin flag set but no reserved server stored — aborting.")
+            with self._lock:
+                self._active_rejoin_attempt_id = None
+            return
+
+        normalized_place_id = self._normalize_numeric_id(place_id)
+        if (
+            normalized_place_id is not None
+            and normalized_place_id in self._subplace_blacklisted_ids
+            and not self._is_subplace_unblock_active()
+        ):
+            self._drop_subplace_join(flow, normalized_place_id, attempt_id=str(attempt_id) if attempt_id else None)
+            with self._lock:
+                self._active_rejoin_attempt_id = None
+                self._awaiting_rejoin_response = False
+            return
+
+        new_payload = {
+            "placeId": place_id,
+            "accessCode": access_code,
+            "isTeleport": True,
+            "isImmersiveAdsTeleport": False,
+        }
+
+        flow.request.url = "https://gamejoin.roblox.com/v1/join-reserved-game"
+        flow.request.raw_content = json.dumps(new_payload).encode("utf-8")
+        if session_id:
+            flow.request.headers["Roblox-Session-Id"] = session_id
+
+        log_buffer.log("randostuff", "Rejoin request -> POST gamejoin.roblox.com/v1/join-reserved-game")
+        with self._lock:
+            self._awaiting_rejoin_response = True
+
+    def response(self, flow):
+        if "gamejoin.roblox.com" not in flow.request.pretty_url:
+            return
+
+        req_path = urlparse(flow.request.pretty_url).path
+
+        self._clear_account_manager_subplace_teleport_if_complete(flow, req_path)
+
+        # Capture jobId from a normal game join initiated by the account manager
+        with self._lock:
+            capture_place_id = self._account_manager_capture_place_id
+        if capture_place_id:
+            if req_path in ("/v1/join-game", "/v1/join-game-instance"):
+                try:
+                    resp_json = json.loads(flow.response.content)
+                    job_id = _extract_job_id(resp_json.get("jobId") or resp_json.get("gameId") or "")
+                    if job_id:
+                        self._game_jobs[capture_place_id] = job_id
+                        place_id_snap = capture_place_id
+                        def _update_ui(jid=job_id, pid=place_id_snap):
+                            if not self._job_id_input.text().strip():
+                                self._job_id_input.setText(jid)
+                                self._auto_filled_for_place = pid
+                        self._on_main(_update_ui)
+                        log_buffer.log("accounts", f"Captured jobId={job_id} for placeId={capture_place_id}")
+                except Exception as exc:
+                    log_buffer.log("accounts", f"Failed to capture jobId from response: {exc}")
+                with self._lock:
+                    self._account_manager_capture_place_id = None
+
+        with self._lock:
+            waiting = self._awaiting_rejoin_response
+            if waiting:
+                self._awaiting_rejoin_response = False
+
+        if not waiting:
+            return
+
+        resp = flow.response
+        if resp is None:
+            log_buffer.log("randostuff", "Rejoin response: (none)")
+            return
+
+        try:
+            body_text = resp.content.decode('utf-8', errors='replace')
+            resp_json = json.loads(body_text)
+            join_ready = bool(resp_json.get("joinScriptUrl"))
+            log_buffer.log(
+                "randostuff",
+                f"Rejoin response status: http={resp.status_code}, status={resp_json.get('status')}, "
+                f"joinScriptUrl={'yes' if join_ready else 'no'}",
+            )
+            # status 2 = join script ready; clear the active attempt so no more redirects
+            if resp_json.get("status") == 2 or join_ready:
+                with self._lock:
+                    self._active_rejoin_attempt_id = None
+                log_buffer.log("randostuff", "Reserved server join ready — stopping redirect.")
+            elif resp.status_code >= 400:
+                with self._lock:
+                    self._active_rejoin_attempt_id = None
+                log_buffer.log("randostuff", "Reserved server join error — stopping redirect.")
+        except Exception as exc:
+            log_buffer.log("randostuff", f"Could not parse rejoin response JSON: {exc}")
+            with self._lock:
+                self._active_rejoin_attempt_id = None
 
     def _on_account_ctx_menu(self, pos):
         item = self._account_list.itemAt(pos)
